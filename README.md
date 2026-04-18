@@ -15,6 +15,10 @@ Sits between Claude Code and the Anthropic API. Every message, bash output, file
 
 Inspired by [zeroc00I/LLM-anonymization](https://github.com/zeroc00I/LLM-anonymization). This is my implementation of that design.
 
+> 🎓 **Student / learning project.** Built to explore how to safely use
+> cloud AI during pentest work. Not a production tool — lab-tested only,
+> not run on real engagement traffic. Expect rough edges.
+>
 > ⚠️ **For research, education, and authorized security testing only.**
 > Use only where you have **explicit written permission** — your own lab,
 > your own assets, a CTF, a bug bounty scope, or a signed pentest contract.
