@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+# redact — local anonymization proxy for Claude Code.
+__version__ = "1.0.0"
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent   # follow symlinks so global installs work
+VENV = HERE / ".venv"
+UVICORN = VENV / "bin" / "uvicorn"
+VAULT_SCRIPT = HERE / "scripts" / "vault"
+
+STATE_DIR = Path(os.environ.get("REDACT_STATE_DIR", Path.home() / ".redact"))
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+CFG_FILE = STATE_DIR / "config.json"
+PID_FILE = STATE_DIR / "proxy.pid"
+LOG_FILE = STATE_DIR / "proxy.log"
+
+DEFAULTS = {
+    "port": 8181,
+    "model": "qwen3:4b-instruct-2507-q4_K_M",
+    "llm_detector": True,
+    "presend_mode": "warn",
+    "engagement": None,
+}
+
+# ANSI — disable if not a TTY or NO_COLOR set
+_USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+def _c(code: str) -> str:
+    return code if _USE_COLOR else ""
+
+RESET = _c("\033[0m")
+BOLD = _c("\033[1m")
+DIM = _c("\033[2m")
+RED = _c("\033[31m")
+GREEN = _c("\033[32m")
+YELLOW = _c("\033[33m")
+CYAN = _c("\033[36m")
+MAG = _c("\033[35m")
+
+
+_BANNER = r"""
+ ██████╗ ███████╗██████╗  █████╗  ██████╗████████╗
+ ██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔════╝╚══██╔══╝
+ ██████╔╝█████╗  ██║  ██║███████║██║        ██║
+ ██╔══██╗██╔══╝  ██║  ██║██╔══██║██║        ██║
+ ██║  ██║███████╗██████╔╝██║  ██║╚██████╗   ██║
+ ╚═╝  ╚═╝╚══════╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝   ╚═╝
+"""
+
+
+def _print_banner() -> None:
+    print(f"{MAG}{_BANNER}{RESET}", end="")
+    print(f" {DIM}anonymization proxy for Claude Code{RESET}  "
+          f"{DIM}·{RESET}  {DIM}v{__version__}{RESET}")
+    print()
+
+
+def _print_top_help() -> None:
+    _print_banner()
+    print(f"{BOLD}USAGE{RESET}")
+    print(f"  redact {DIM}<command>{RESET} {DIM}[options]{RESET}")
+    print()
+    print(f"{BOLD}COMMANDS{RESET}")
+    rows = [
+        ("start  <engagement>",    "start proxy for an engagement"),
+        ("stop",                    "stop the running proxy"),
+        ("status",                  "show proxy state and config"),
+        ("claude   [args...]",      "launch Claude Code through the proxy"),
+        ("run  -- <cmd>",           "run any command through the proxy"),
+        ("logs [-f]",               "tail proxy logs"),
+        ("tunnel  <user@vps>",      "SSH tunnel laptop → VPS proxy"),
+        ("vault    <subcommand>",   "inspect vault (list, find, stats, …)"),
+        ("config   <show|set>",     "view or change persisted defaults"),
+    ]
+    for cmd, desc in rows:
+        print(f"  {CYAN}{cmd:<24}{RESET}  {desc}")
+    print()
+    print(f"{BOLD}EXAMPLES{RESET}")
+    print(f"  {CYAN}redact start acme-q2{RESET}          {DIM}# start an engagement{RESET}")
+    print(f"  {CYAN}redact claude{RESET}                 {DIM}# use Claude through it{RESET}")
+    print(f"  {CYAN}redact vault find 10.0.0.5{RESET}    {DIM}# look up a real or fake value{RESET}")
+    print(f"  {CYAN}redact stop{RESET}                   {DIM}# stop when done{RESET}")
+    print()
+    print(f"  Run {CYAN}redact <command> -h{RESET} for details on each command.")
+    print()
+
+
+def _load() -> dict:
+    if CFG_FILE.exists():
+        try:
+            return {**DEFAULTS, **json.loads(CFG_FILE.read_text())}
+        except json.JSONDecodeError:
+            pass
+    return dict(DEFAULTS)
+
+
+def _save(cfg: dict) -> None:
+    CFG_FILE.write_text(json.dumps(cfg, indent=2))
+
+
+def _running_pid() -> int | None:
+    if not PID_FILE.exists():
+        return None
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        PID_FILE.unlink(missing_ok=True)
+        return None
+
+
+def _ollama_ok() -> bool:
+    try:
+        import urllib.request
+        urllib.request.urlopen(
+            os.environ.get("OLLAMA_HOST", "http://localhost:11434") + "/api/tags",
+            timeout=1,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _check_venv() -> None:
+    if not UVICORN.exists():
+        print(f"{RED}venv missing — run: ./scripts/install.sh{RESET}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------- commands ----------
+
+def cmd_start(args) -> None:
+    _check_venv()
+    cfg = _load()
+    engagement = args.engagement or cfg.get("engagement")
+    if not engagement:
+        print(f"{RED}error:{RESET} engagement name is required")
+        print(f"   {CYAN}redact start <client-name>{RESET}")
+        print(f"   {DIM}example: redact start acme-corp-2026-q2{RESET}")
+        sys.exit(1)
+    cfg["engagement"] = engagement
+    if args.port:
+        cfg["port"] = args.port
+    if args.model:
+        cfg["model"] = args.model
+    if args.no_llm:
+        cfg["llm_detector"] = False
+    if args.presend:
+        cfg["presend_mode"] = args.presend
+    if args.wordlist is not None:
+        cfg["wordlist"] = args.wordlist or None
+    _save(cfg)
+
+    pid = _running_pid()
+    if pid:
+        print(f"{YELLOW}proxy already running (pid {pid}).{RESET} stop first: redact stop")
+        return
+
+    ollama_host = args.ollama_host or os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    llm_reachable = _ollama_ok() if not args.ollama_host else True  # trust user's override
+    llm_on = cfg["llm_detector"] and llm_reachable
+    if cfg["llm_detector"] and not llm_reachable:
+        print(f"{YELLOW}⚠  Ollama not reachable at {ollama_host} — starting in regex-only mode.{RESET}")
+        print(f"   install: curl -fsSL https://ollama.com/install.sh | sh")
+        print(f"   then: ollama pull {cfg['model']}")
+
+    env = os.environ.copy()
+    env.update({
+        "ENGAGEMENT_ID": engagement,
+        "PORT": str(cfg["port"]),
+        "LLM_DETECTOR": "true" if llm_on else "false",
+        "LLM_MODEL": cfg["model"],
+        "PRESEND_MODE": cfg["presend_mode"],
+        "OLLAMA_HOST": ollama_host,
+    })
+    if args.upstream:
+        env["UPSTREAM_URL"] = args.upstream
+    if args.vault_dir:
+        env["VAULT_DIR"] = args.vault_dir
+    if args.timeout:
+        env["LLM_TIMEOUT"] = str(args.timeout)
+    wordlist = cfg.get("wordlist")
+    if wordlist:
+        env["WORDLIST_PATH"] = wordlist
+
+    cmd = [str(UVICORN), "anon_proxy.server:app",
+           "--app-dir", str(HERE),
+           "--host", "127.0.0.1",
+           "--port", str(cfg["port"]),
+           "--log-level", "info"]
+
+    if args.foreground:
+        print(f"{DIM}running in foreground — Ctrl+C to stop{RESET}")
+        for k, v in sorted(env.items()):
+            if k.startswith(("ENGAGEMENT_", "LLM_", "PRESEND_", "OLLAMA_", "UPSTREAM_", "VAULT_", "PORT")):
+                print(f"  {k}={v}")
+        os.execvpe(cmd[0], cmd, env)
+        return
+
+    log_f = open(LOG_FILE, "a")
+    log_f.write(f"\n===== proxy starting at {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+    log_f.flush()
+    proc = subprocess.Popen(
+        cmd, cwd=HERE, env=env, stdout=log_f, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    PID_FILE.write_text(str(proc.pid))
+    time.sleep(1.5)
+    if proc.poll() is not None:
+        print(f"{RED}✗ proxy died immediately — see {LOG_FILE}{RESET}")
+        PID_FILE.unlink(missing_ok=True)
+        sys.exit(1)
+
+    print(f"  {GREEN}●{RESET} proxy started   {DIM}pid {proc.pid}   http://localhost:{cfg['port']}{RESET}")
+    print()
+    rows = [
+        ("engagement", f"{CYAN}{engagement}{RESET}"),
+        ("llm",        cfg['model'] if llm_on else f"{DIM}off{RESET}"),
+        ("presend",    cfg['presend_mode']),
+    ]
+    if args.upstream:
+        rows.append(("upstream", args.upstream))
+    if args.ollama_host and args.ollama_host != "http://localhost:11434":
+        rows.append(("ollama", args.ollama_host))
+    if args.vault_dir:
+        rows.append(("vault dir", args.vault_dir))
+    rows.append(("logs", str(LOG_FILE)))
+    for k, v in rows:
+        print(f"  {k:<12}  {v}")
+    print()
+    print(f"  next:  {CYAN}redact claude{RESET}")
+
+
+def cmd_stop(args) -> None:
+    pid = _running_pid()
+    if not pid:
+        print(f"{DIM}proxy not running{RESET}")
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(10):
+            time.sleep(0.2)
+            if _running_pid() is None:
+                break
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    PID_FILE.unlink(missing_ok=True)
+    print(f"{GREEN}✓ proxy stopped{RESET} (pid {pid})")
+
+
+def cmd_status(args) -> None:
+    pid = _running_pid()
+    cfg = _load()
+    engagement = cfg.get("engagement") or ""
+
+    if pid:
+        print(f"  {GREEN}●{RESET} proxy running   {DIM}pid {pid}   http://localhost:{cfg['port']}{RESET}")
+    else:
+        print(f"  {DIM}○ proxy stopped{RESET}")
+    print()
+    rows = [
+        ("engagement",  engagement or f"{DIM}(none){RESET}"),
+        ("llm",         f"{cfg['model']}" if cfg['llm_detector'] else f"{DIM}off{RESET}"),
+        ("ollama",      "reachable" if _ollama_ok() else f"{DIM}not reachable{RESET}"),
+        ("presend",     cfg.get("presend_mode", "warn")),
+        ("config",      str(CFG_FILE)),
+    ]
+    for k, v in rows:
+        print(f"  {k:<12}  {v}")
+
+
+def cmd_claude(args) -> None:
+    pid = _running_pid()
+    cfg = _load()
+    if not pid:
+        print(f"{RED}proxy not running.{RESET} start it first: redact start <engagement>")
+        sys.exit(1)
+    env = os.environ.copy()
+    env["ANTHROPIC_BASE_URL"] = f"http://localhost:{cfg['port']}"
+    try:
+        os.execvpe("claude", ["claude", *args.extras], env)
+    except FileNotFoundError:
+        print(f"{RED}claude CLI not found in PATH{RESET}")
+        sys.exit(1)
+
+
+def cmd_run(args) -> None:
+    # Strip leading '--' separator if present (argparse keeps it with REMAINDER)
+    cmd = list(args.cmd)
+    while cmd and cmd[0] == "--":
+        cmd.pop(0)
+    if not cmd:
+        print(f"{RED}error:{RESET} no command given")
+        print(f"  {CYAN}redact run -- <command> [args...]{RESET}")
+        print(f"  {DIM}example: redact run -- python my_script.py{RESET}")
+        sys.exit(1)
+    pid = _running_pid()
+    cfg = _load()
+    if not pid:
+        print(f"{RED}error:{RESET} proxy not running")
+        print(f"  start it first: {CYAN}redact start <engagement>{RESET}")
+        sys.exit(1)
+    env = os.environ.copy()
+    env["ANTHROPIC_BASE_URL"] = f"http://localhost:{cfg['port']}"
+    try:
+        os.execvpe(cmd[0], cmd, env)
+    except FileNotFoundError:
+        print(f"{RED}error:{RESET} command not found: {cmd[0]}")
+        sys.exit(127)
+
+
+def cmd_tunnel(args) -> None:
+    """Open an SSH tunnel: laptop:PORT  ↔  vps:PORT (local port-forward)."""
+    if not args.host:
+        print(f"{RED}error:{RESET} need an SSH destination")
+        print(f"  {CYAN}redact tunnel user@vps-ip{RESET}")
+        sys.exit(1)
+    cfg = _load()
+    port = args.port or cfg.get("port", 8181)
+    ollama_port = 11434 if args.ollama else None
+
+    # Build ssh command
+    ssh_cmd = ["ssh", "-N", "-L", f"{port}:localhost:{port}"]
+    if ollama_port:
+        ssh_cmd += ["-L", f"{ollama_port}:localhost:{ollama_port}"]
+    ssh_cmd += [args.host]
+
+    print(f"  {GREEN}●{RESET} opening tunnel   {DIM}{args.host}{RESET}")
+    print()
+    print(f"  laptop localhost:{port}  {DIM}↔{RESET}  vps localhost:{port}  {DIM}(proxy){RESET}")
+    if ollama_port:
+        print(f"  laptop localhost:{ollama_port}  {DIM}↔{RESET}  vps localhost:{ollama_port}  {DIM}(ollama){RESET}")
+    print()
+    print(f"  next (in another laptop terminal):")
+    print(f"    {CYAN}export ANTHROPIC_BASE_URL=http://localhost:{port}{RESET}")
+    print(f"    {CYAN}claude{RESET}")
+    print()
+    print(f"  {DIM}Ctrl+C here closes the tunnel.{RESET}")
+    print()
+    try:
+        os.execvp("ssh", ssh_cmd)
+    except FileNotFoundError:
+        print(f"{RED}error:{RESET} ssh not found in PATH")
+        sys.exit(1)
+
+
+def cmd_logs(args) -> None:
+    if not LOG_FILE.exists():
+        print(f"{DIM}no logs yet{RESET}")
+        return
+    cmd = ["tail", "-f", str(LOG_FILE)] if args.follow else ["tail", "-n", str(args.lines), str(LOG_FILE)]
+    subprocess.run(cmd)
+
+
+def cmd_vault(args) -> None:
+    # Show our own help if no subcommand given, instead of forwarding to
+    # the vault script (which errors out).
+    if not args.vault_args:
+        _print_vault_help()
+        return
+    cfg = _load()
+    if cfg.get("engagement") and "-e" not in args.vault_args and "--engagement" not in args.vault_args:
+        if args.vault_args[0] in ("list", "stats", "find", "path"):
+            args.vault_args = [args.vault_args[0], "-e", cfg["engagement"], *args.vault_args[1:]]
+    os.execvp(str(VAULT_SCRIPT), ["vault", *args.vault_args])
+
+
+def _print_vault_help() -> None:
+    print(f"{BOLD}redact vault{RESET} — inspect anonymization vaults")
+    print()
+    print(f"{BOLD}USAGE{RESET}")
+    print(f"  redact vault {DIM}<subcommand>{RESET} {DIM}[args]{RESET}")
+    print()
+    print(f"{BOLD}SUBCOMMANDS{RESET}")
+    rows = [
+        ("list",            "all real ↔ fake mappings for current engagement"),
+        ("stats",           "counts per entity type"),
+        ("find <query>",    "search for a real or surrogate value"),
+        ("engagements",     "list every engagement on disk"),
+        ("clear <name>",    "delete an engagement's vault + secret + audit"),
+        ("path",            "show file paths for current engagement"),
+    ]
+    for s, d in rows:
+        print(f"  {CYAN}{s:<18}{RESET}  {d}")
+    print()
+    print(f"{BOLD}EXAMPLES{RESET}")
+    print(f"  {CYAN}redact vault list{RESET}")
+    print(f"  {CYAN}redact vault find 10.20.0.10{RESET}")
+    print(f"  {CYAN}redact vault clear old-engagement{RESET}")
+    print()
+
+
+def cmd_config_show(args) -> None:
+    cfg = _load()
+    print(f"  {DIM}{CFG_FILE}{RESET}")
+    print()
+    for k, v in cfg.items():
+        display = v if v not in (None, "") else f"{DIM}(unset){RESET}"
+        print(f"  {k:<14}  {display}")
+
+
+def cmd_config_set(args) -> None:
+    cfg = _load()
+    if args.key not in DEFAULTS:
+        print(f"{RED}unknown key: {args.key}{RESET}")
+        print(f"valid keys: {', '.join(DEFAULTS.keys())}")
+        sys.exit(1)
+    v = args.value
+    if args.key == "port":
+        v = int(v)
+    elif args.key == "llm_detector":
+        v = v.lower() in ("true", "1", "yes", "on")
+    cfg[args.key] = v
+    _save(cfg)
+    print(f"{GREEN}✓{RESET} set {args.key}={v}")
+
+
+class _TopHelpParser(argparse.ArgumentParser):
+    """Top-level parser that uses our hand-formatted help."""
+    def format_help(self) -> str:  # override
+        import io
+        buf = io.StringIO()
+        _stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            _print_top_help()
+        finally:
+            sys.stdout = _stdout
+        return buf.getvalue()
+
+
+def main() -> None:
+    p = _TopHelpParser(
+        prog="redact",
+        add_help=True,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--version", action="version", version=f"redact {__version__}")
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND", parser_class=argparse.ArgumentParser)
+
+    # start
+    sp = sub.add_parser(
+        "start",
+        help="start proxy in background",
+        description="Start the proxy as a background daemon. Defaults are "
+                    "read from ~/.redact/config.json; any flag below overrides.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(f"{BOLD}Examples{RESET}\n"
+                f"  {CYAN}redact start acme-q2{RESET}\n"
+                f"  {CYAN}redact start acme-q2 --port 9000{RESET}\n"
+                f"  {CYAN}redact start acme-q2 --no-llm{RESET}         {DIM}# no Ollama needed{RESET}\n"
+                f"  {CYAN}redact start acme-q2 --presend block{RESET}  {DIM}# refuse on leak{RESET}"),
+    )
+    sp.add_argument("engagement", nargs="?",
+                    help="engagement name (reuses last if omitted)")
+    sp.add_argument("--port", type=int, metavar="N",
+                    help="proxy listen port (default: 8181)")
+    sp.add_argument("--model", metavar="NAME",
+                    help="Ollama model (default: qwen3:4b-instruct-2507-q4_K_M)")
+    sp.add_argument("--no-llm", action="store_true",
+                    help="disable LLM detection layer (regex-only, no Ollama required)")
+    sp.add_argument("--presend", choices=["off", "warn", "block"], metavar="MODE",
+                    help="pre-send scanner: off | warn (default) | block")
+    sp.add_argument("--upstream", metavar="URL",
+                    help="override Anthropic API URL (default: https://api.anthropic.com)")
+    sp.add_argument("--ollama-host", metavar="URL",
+                    help="Ollama endpoint (default: http://localhost:11434)")
+    sp.add_argument("--vault-dir", metavar="DIR",
+                    help="vault storage location (default: ~/.anon-proxy)")
+    sp.add_argument("--timeout", type=int, metavar="SEC",
+                    help="LLM per-call timeout seconds (default: 15)")
+    sp.add_argument("-f", "--foreground", action="store_true",
+                    help="run in foreground instead of backgrounding (for debugging)")
+    sp.add_argument("--wordlist", metavar="FILE",
+                    help="path to engagement wordlist (one value per line, "
+                         "optional :TYPE suffix). Pass empty string to clear.")
+    sp.set_defaults(func=cmd_start)
+
+    # stop
+    sp = sub.add_parser("stop", help="stop the running proxy")
+    sp.set_defaults(func=cmd_stop)
+
+    # status
+    sp = sub.add_parser("status", help="show proxy + config status")
+    sp.set_defaults(func=cmd_status)
+
+    # claude
+    sp = sub.add_parser(
+        "claude",
+        help="launch claude with ANTHROPIC_BASE_URL set",
+        description="Launch Claude Code through the proxy. Extra args forwarded to claude.",
+    )
+    sp.add_argument("extras", nargs=argparse.REMAINDER, help="forwarded to claude")
+    sp.set_defaults(func=cmd_claude)
+
+    # run
+    sp = sub.add_parser(
+        "run",
+        help="run any command with ANTHROPIC_BASE_URL set",
+        description="Run any subprocess through the proxy. Example: redact run -- python script.py",
+    )
+    sp.add_argument("cmd", nargs=argparse.REMAINDER, metavar="CMD")
+    sp.set_defaults(func=cmd_run)
+
+    # tunnel
+    sp = sub.add_parser(
+        "tunnel",
+        help="SSH tunnel from laptop to proxy on VPS",
+        description="Open an SSH local-port-forward so your laptop can reach a "
+                    "proxy running on a VPS. Blocks until Ctrl+C.",
+        epilog=(f"{BOLD}Examples{RESET}\n"
+                f"  {CYAN}redact tunnel root@1.2.3.4{RESET}           {DIM}# forward proxy port{RESET}\n"
+                f"  {CYAN}redact tunnel root@1.2.3.4 --ollama{RESET}  {DIM}# also forward Ollama (11434){RESET}\n"
+                f"  {CYAN}redact tunnel root@1.2.3.4 --port 9000{RESET}"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sp.add_argument("host", nargs="?", help="SSH destination (user@host)")
+    sp.add_argument("--port", type=int, help="proxy port on both sides (default: from config)")
+    sp.add_argument("--ollama", action="store_true",
+                    help="also forward Ollama port 11434 (for remote LLM)")
+    sp.set_defaults(func=cmd_tunnel)
+
+    # logs
+    sp = sub.add_parser("logs", help="tail proxy logs")
+    sp.add_argument("-f", "--follow", action="store_true", help="follow log (tail -f)")
+    sp.add_argument("-n", "--lines", type=int, default=50,
+                    help="number of lines to show (default: 50)")
+    sp.set_defaults(func=cmd_logs)
+
+    # vault (delegate)
+    sp = sub.add_parser(
+        "vault",
+        help="inspect the vault (list/stats/find/engagements/clear/path)",
+        description=(
+            f"{BOLD}Vault inspection.{RESET}  "
+            "Uses current engagement unless you pass -e NAME.\n\n"
+            f"{BOLD}Subcommands{RESET}\n"
+            "  list            all real↔fake mappings\n"
+            "  stats           counts per entity type\n"
+            "  find QUERY      search real or surrogate value\n"
+            "  engagements     every engagement you've ever created\n"
+            "  clear NAME      delete a vault + secret + audit\n"
+            "  path            show file paths for current engagement\n\n"
+            f"{BOLD}Examples{RESET}\n"
+            f"  {CYAN}redact vault list{RESET}\n"
+            f"  {CYAN}redact vault find 10.20.0.10{RESET}\n"
+            f"  {CYAN}redact vault clear old-engagement{RESET}"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sp.add_argument("vault_args", nargs=argparse.REMAINDER)
+    sp.set_defaults(func=cmd_vault)
+
+    # config
+    cfgp = sub.add_parser(
+        "config",
+        help="view or change persisted defaults",
+        description=(
+            f"{BOLD}Config.{RESET}  Lives at ~/.redact/config.json.\n\n"
+            f"{BOLD}Keys{RESET}\n"
+            "  port           proxy listen port (default 8181)\n"
+            "  model          Ollama model name\n"
+            "  llm_detector   on | off\n"
+            "  presend_mode   off | warn | block\n"
+            "  engagement     last engagement used\n\n"
+            f"{BOLD}Examples{RESET}\n"
+            f"  {CYAN}redact config show{RESET}\n"
+            f"  {CYAN}redact config set port 9000{RESET}\n"
+            f"  {CYAN}redact config set llm_detector off{RESET}"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    cfgsub = cfgp.add_subparsers(dest="subcmd", metavar="SUBCMD")
+    csp = cfgsub.add_parser("show", help="print current config")
+    csp.set_defaults(func=cmd_config_show)
+    csp = cfgsub.add_parser("set", help="update a config value")
+    csp.add_argument("key", help="port | model | llm_detector | presend_mode | engagement")
+    csp.add_argument("value")
+    csp.set_defaults(func=cmd_config_set)
+    cfgp.set_defaults(func=lambda _a: cfgp.print_help())
+
+    args = p.parse_args()
+    if not getattr(args, "func", None):
+        _print_top_help()
+        sys.exit(0)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

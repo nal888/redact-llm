@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""vault — inspect / search / manage redact-llm vaults.
+
+Usage:
+  vault list [-e <engagement>] [-t <type>]    show all mappings
+  vault stats [-e <engagement>]               show counts per type
+  vault find <query> [-e <engagement>]        search real or surrogate
+  vault engagements                           list all engagements
+  vault clear <engagement>                    wipe an engagement (asks)
+  vault path [-e <engagement>]                show file paths
+"""
+import argparse
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+VAULT_DIR = Path(os.environ.get("VAULT_DIR", Path.home() / ".anon-proxy"))
+DEFAULT_ENG = os.environ.get("ENGAGEMENT_ID", "default")
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+RED = "\033[31m"
+
+
+def _vault_path(eng: str) -> Path:
+    return VAULT_DIR / f"{eng}.sqlite"
+
+
+def _audit_path(eng: str) -> Path:
+    return VAULT_DIR / f"{eng}.audit.sqlite"
+
+
+def _check(path: Path) -> sqlite3.Connection:
+    if not path.exists():
+        print(f"{RED}not found: {path}{RESET}", file=sys.stderr)
+        sys.exit(1)
+    return sqlite3.connect(path)
+
+
+def cmd_list(args):
+    c = _check(_vault_path(args.engagement))
+    q = "SELECT entity_type, real, surrogate, first_seen FROM mappings"
+    params: list = []
+    if args.type:
+        q += " WHERE entity_type = ?"
+        params.append(args.type.upper())
+    q += " ORDER BY first_seen"
+    rows = c.execute(q, params).fetchall()
+    if not rows:
+        print(f"{DIM}(empty){RESET}")
+        return
+    print(f"{BOLD}Engagement: {args.engagement}  ({len(rows)} mappings){RESET}")
+    print(f"{BOLD}{'TYPE':<14} {'REAL':<40} → SURROGATE{RESET}")
+    for t, real, sur, _ in rows:
+        print(f"{CYAN}{t:<14}{RESET} {real:<40} {DIM}→{RESET} {GREEN}{sur}{RESET}")
+
+
+def cmd_stats(args):
+    c = _check(_vault_path(args.engagement))
+    rows = c.execute(
+        "SELECT entity_type, COUNT(*) FROM mappings GROUP BY entity_type ORDER BY COUNT(*) DESC"
+    ).fetchall()
+    total = sum(n for _, n in rows)
+    print(f"{BOLD}Engagement: {args.engagement}{RESET}")
+    print(f"Total mappings: {total}")
+    print()
+    for t, n in rows:
+        bar = "█" * min(n, 40)
+        print(f"  {CYAN}{t:<14}{RESET} {n:>4}  {bar}")
+
+    ap = _audit_path(args.engagement)
+    if ap.exists():
+        ac = sqlite3.connect(ap)
+        req = ac.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+        ev = ac.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        print()
+        print(f"{DIM}audit: {req} requests, {ev} entity events logged{RESET}")
+
+
+def cmd_find(args):
+    c = _check(_vault_path(args.engagement))
+    q = args.query
+    rows = c.execute(
+        "SELECT entity_type, real, surrogate FROM mappings "
+        "WHERE real LIKE ? OR surrogate LIKE ?",
+        (f"%{q}%", f"%{q}%"),
+    ).fetchall()
+    if not rows:
+        print(f"{DIM}no match for: {q}{RESET}")
+        return
+    print(f"{BOLD}Matches for '{q}' ({len(rows)}){RESET}")
+    for t, real, sur in rows:
+        direction = "real" if q.lower() in real.lower() else "fake"
+        print(f"  {CYAN}{t:<14}{RESET} {real} {DIM}→{RESET} {GREEN}{sur}{RESET} {DIM}(matched {direction}){RESET}")
+
+
+def cmd_engagements(_args):
+    files = sorted(VAULT_DIR.glob("*.sqlite"))
+    files = [f for f in files if not f.name.endswith(".audit.sqlite")]
+    if not files:
+        print(f"{DIM}no engagements in {VAULT_DIR}{RESET}")
+        return
+    print(f"{BOLD}Engagements ({VAULT_DIR}){RESET}")
+    for f in files:
+        eng = f.stem
+        try:
+            c = sqlite3.connect(f)
+            n = c.execute("SELECT COUNT(*) FROM mappings").fetchone()[0]
+            size_kb = f.stat().st_size / 1024
+            print(f"  {CYAN}{eng:<30}{RESET} {n:>4} mappings  {DIM}({size_kb:>6.1f} KB){RESET}")
+        except Exception as e:
+            print(f"  {RED}{eng:<30}{RESET} error: {e}")
+
+
+def cmd_clear(args):
+    paths = [
+        _vault_path(args.engagement),
+        _audit_path(args.engagement),
+        VAULT_DIR / f"{args.engagement}.key",
+    ]
+    existing = [p for p in paths if p.exists() or any(p.parent.glob(p.name + "*"))]
+    if not existing:
+        print(f"{DIM}nothing to clear for '{args.engagement}'{RESET}")
+        return
+    print(f"{YELLOW}About to delete:{RESET}")
+    for p in paths:
+        for match in p.parent.glob(p.name + "*"):
+            print(f"  {match}")
+    resp = input(f"{YELLOW}Proceed? [y/N] {RESET}").strip().lower()
+    if resp != "y":
+        print("aborted")
+        return
+    for p in paths:
+        for match in p.parent.glob(p.name + "*"):
+            match.unlink()
+            print(f"  deleted {match}")
+
+
+def cmd_path(args):
+    vp = _vault_path(args.engagement)
+    ap = _audit_path(args.engagement)
+    kp = VAULT_DIR / f"{args.engagement}.key"
+    print(f"{BOLD}Engagement: {args.engagement}{RESET}")
+    for label, p in [("vault", vp), ("audit", ap), ("secret", kp)]:
+        mark = f"{GREEN}✓{RESET}" if p.exists() else f"{RED}✗{RESET}"
+        print(f"  {mark} {label:<6} {p}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="vault", description="inspect redact-llm vaults")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add_eng(sp):
+        sp.add_argument("-e", "--engagement", default=DEFAULT_ENG,
+                        help=f"engagement name (default: {DEFAULT_ENG})")
+
+    sp = sub.add_parser("list", help="list all mappings")
+    add_eng(sp)
+    sp.add_argument("-t", "--type", help="filter by entity type (e.g. IPV4, DOMAIN)")
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("stats", help="show counts per type")
+    add_eng(sp)
+    sp.set_defaults(func=cmd_stats)
+
+    sp = sub.add_parser("find", help="search real or surrogate values")
+    add_eng(sp)
+    sp.add_argument("query")
+    sp.set_defaults(func=cmd_find)
+
+    sp = sub.add_parser("engagements", help="list all engagements")
+    sp.set_defaults(func=cmd_engagements)
+
+    sp = sub.add_parser("clear", help="delete an engagement's vault + key + audit")
+    sp.add_argument("engagement")
+    sp.set_defaults(func=cmd_clear)
+
+    sp = sub.add_parser("path", help="show file paths for an engagement")
+    add_eng(sp)
+    sp.set_defaults(func=cmd_path)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
